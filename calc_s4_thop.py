@@ -1,152 +1,495 @@
-import os
 import argparse
-import warnings
+from pathlib import Path
+from typing import Dict, List, Tuple
 
+import numpy as np
 import torch
-from torch.utils.data import DataLoader
-from thop import profile
 
-from dataset import MultimodalDataset, collate_fn
+from dataset import MultimodalDataset
 from model import MultiModalNet
 
-warnings.filterwarnings("ignore")
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+
+# ================= 配置 =================
+CLASS_MAP = {"AD": 0, "HC": 1, "MCI": 2}
+
+DEFAULT_SHARED_DIM = 512
+DEFAULT_DROPOUT = 0.5
+DEFAULT_NUM_CLASSES = 3
+
+# 当前 S4 中固定使用的结构超参数。
+AUDIO_LA_HEADS = 4
+AUDIO_POOL_HEADS = 4
+TEXT_ATTN_HEADS = 4
+TEXT_LOW_RANK_DIM = 64
+TEXT_ASP_HIDDEN = 256
+CROSS_ATTN_HEADS = 4
+JCR_REDUCTION = 8
 
 
-def human_readable_count(num):
-    """将数字格式化为更易读的 K / M / G / T 单位字符串。"""
-    num = float(num)
-    if num >= 1e12:
-        return f"{num / 1e12:.3f}T"
-    elif num >= 1e9:
-        return f"{num / 1e9:.3f}G"
-    elif num >= 1e6:
-        return f"{num / 1e6:.3f}M"
-    elif num >= 1e3:
-        return f"{num / 1e3:.3f}K"
-    else:
-        return f"{num:.3f}"
-
-
-def count_trainable_params(model):
-    """统计可训练参数量。"""
-    return sum(p.numel() for p in model.parameters() if p.requires_grad)
-
-
-def build_model(test_dataset, class_names, device, shared_dim, dropout):
-    """构建 S4 模型。"""
-    model = MultiModalNet(
-        audio_dim=test_dataset[0][0].shape[1],
-        text_dim=test_dataset[0][1].shape[1],
-        num_classes=len(class_names),
-        fusion_type="gated_bi_cross_attention",
-        dropout=dropout,
-        shared_dim=shared_dim,
-    ).to(device)
-    return model
-
-
-def get_one_batch(data_root, split, class_map, batch_size):
-    """加载一个 batch，用于 THOP 统计。"""
-    dataset = MultimodalDataset(os.path.join(data_root, split), class_map)
-    loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=0,
-        collate_fn=collate_fn,
+# ================= 参数统计 =================
+def count_parameters(model: torch.nn.Module) -> Tuple[int, int]:
+    """使用 PyTorch 原生参数树统计总参数量和可训练参数量。"""
+    total = sum(parameter.numel() for parameter in model.parameters())
+    trainable = sum(
+        parameter.numel()
+        for parameter in model.parameters()
+        if parameter.requires_grad
     )
-    batch = next(iter(loader))
-    return dataset, batch
+    return total, trainable
 
 
-def main():
-    parser = argparse.ArgumentParser(description="使用 THOP 统计 S4 模型参数量和 FLOPs")
-    parser.add_argument("--data_root", type=str, default="NCMMSC2021", help="数据根目录")
-    parser.add_argument("--split", type=str, default="test", choices=["train", "test"], help="统计使用的数据划分")
-    parser.add_argument("--batch_size", type=int, default=4, help="用于 profile 的 batch size")
-    parser.add_argument("--shared_dim", type=int, default=512, help="模型 shared_dim")
-    parser.add_argument("--dropout", type=float, default=0.5, help="dropout")
-    parser.add_argument("--weights_file", type=str, default=os.path.join("weights_2024", "best.pth"), help="权重路径")
-    parser.add_argument("--use_cpu", action="store_true", help="强制使用 CPU 统计")
-    parser.add_argument("--save_txt", type=str, default="s4_complexity_thop.txt", help="结果保存 txt 文件名")
+def parameter_breakdown(model: MultiModalNet) -> Dict[str, int]:
+    """按 S4 主要模块统计参数量，便于复核。"""
+    return {
+        "audio_subnet": sum(
+            parameter.numel()
+            for parameter in model.audio_subnet.parameters()
+        ),
+        "text_subnet": sum(
+            parameter.numel()
+            for parameter in model.text_subnet.parameters()
+        ),
+        "audio_projection": sum(
+            parameter.numel()
+            for parameter in model.audio_proj_pre.parameters()
+        ),
+        "text_projection": sum(
+            parameter.numel()
+            for parameter in model.text_proj_pre.parameters()
+        ),
+        "audio_from_text_attention": sum(
+            parameter.numel()
+            for parameter in model.a_from_t.parameters()
+        ),
+        "text_from_audio_attention": sum(
+            parameter.numel()
+            for parameter in model.t_from_a.parameters()
+        ),
+        "jcr": sum(
+            parameter.numel()
+            for parameter in model.jcr_module.parameters()
+        ),
+        "classifier": sum(
+            parameter.numel()
+            for parameter in model.classifier.parameters()
+        ),
+    }
+
+
+# ================= FLOPs 统计 =================
+def audio_subnet_macs(
+    sequence_length: int,
+    dim: int,
+    num_heads: int,
+) -> int:
+    """
+    统计 AudioSubNet 的主要矩阵乘法 MACs。
+
+    包括：
+    - LinearAttention Q/K/V/out projections；
+    - K^T V、Q(K^T V)、Qz；
+    - MultiHeadQueryPooling Q/K/V/out projections；
+    - pooling attention score 和 attention-value。
+
+    不统计 LayerNorm、ELU、mask、除法、Dropout 等逐元素操作。
+    """
+    t = int(sequence_length)
+    d = int(dim)
+    h = int(num_heads)
+
+    if t <= 0 or d <= 0:
+        raise ValueError(
+            "Audio sequence length and dimension must be positive."
+        )
+    if d % h != 0:
+        raise ValueError(
+            "Audio feature dimension must be divisible by num_heads."
+        )
+
+    # LinearAttention Q/K/V/out projections.
+    projection_macs = 4 * t * d * d
+
+    # K^T V and Q(K^T V): each T * D^2 / H.
+    linear_attention_macs = 2 * t * d * d // h
+
+    # Q z.
+    normalization_product_macs = t * d
+
+    # Query pooling MHA, query length=1, key/value length=T.
+    # Q/K/V/out projections.
+    pooling_projection_macs = (2 * t + 2) * d * d
+
+    # QK^T and attention @ V.
+    pooling_attention_macs = 2 * t * d
+
+    return (
+        projection_macs
+        + linear_attention_macs
+        + normalization_product_macs
+        + pooling_projection_macs
+        + pooling_attention_macs
+    )
+
+
+def text_subnet_macs(
+    sequence_length: int,
+    dim: int,
+    num_heads: int,
+    low_rank_dim: int,
+    asp_hidden: int,
+) -> int:
+    """
+    统计 TextSubNet 的主要矩阵乘法 MACs。
+
+    包括：
+    - Q/K/V/out projections；
+    - q_low/k_low；
+    - low-rank attention score；
+    - original attention score；
+    - attention @ V；
+    - alpha gate；
+    - AttentiveStatsPool scorer、bmm 和 projection。
+
+    不统计 LayerNorm、normalize、softmax、mask、GELU、sqrt 等逐元素操作。
+    """
+    t = int(sequence_length)
+    d = int(dim)
+    h = int(num_heads)
+    r = int(low_rank_dim)
+    a = int(asp_hidden)
+
+    if t <= 0 or d <= 0:
+        raise ValueError(
+            "Text sequence length and dimension must be positive."
+        )
+    if d % h != 0:
+        raise ValueError(
+            "Text feature dimension must be divisible by num_heads."
+        )
+
+    projection_macs = 4 * t * d * d
+    low_rank_projection_macs = 2 * t * d * r
+    low_rank_score_macs = h * t * t * r
+    full_attention_macs = 2 * t * t * d
+    gate_macs = d * h
+    scorer_macs = t * d * a + t * a
+    stats_pool_macs = 2 * t * d
+    stats_projection_macs = 2 * d * d
+
+    return (
+        projection_macs
+        + low_rank_projection_macs
+        + low_rank_score_macs
+        + full_attention_macs
+        + gate_macs
+        + scorer_macs
+        + stats_pool_macs
+        + stats_projection_macs
+    )
+
+
+def cross_attention_macs(
+    query_length: int,
+    key_value_length: int,
+    dim: int,
+) -> int:
+    """
+    统计一个 CrossAttnSeqToSeq 的主要矩阵乘法 MACs。
+
+    包括 Q/K/V/out projections、QK^T 和 attention @ V。
+    """
+    lq = int(query_length)
+    lkv = int(key_value_length)
+    d = int(dim)
+
+    if lq <= 0 or lkv <= 0 or d <= 0:
+        raise ValueError(
+            "Query length, key/value length, and dimension must be positive."
+        )
+
+    query_side_projection = 2 * lq * d * d
+    key_value_projection = 2 * lkv * d * d
+    attention_matrix_macs = 2 * lq * lkv * d
+
+    return (
+        query_side_projection
+        + key_value_projection
+        + attention_matrix_macs
+    )
+
+
+def s4_macs_per_sample(
+    audio_length: int,
+    text_length: int,
+    audio_dim: int,
+    text_dim: int,
+    shared_dim: int,
+    num_classes: int,
+) -> int:
+    """
+    统计一条真实样本对应的 S4 主要矩阵乘法 MACs。
+
+    S4:
+    AudioSubNet/TextSubNet
+    -> pooled feature projections
+    -> sequence projections
+    -> bidirectional cross-attention
+    -> JCR
+    -> classifier
+
+    统计口径与最终 S1/S2/S3 完全一致：
+    只统计 Linear / matmul / bmm 的乘加运算。
+    """
+    la = int(audio_length)
+    lt = int(text_length)
+    da = int(audio_dim)
+    dt = int(text_dim)
+    ds = int(shared_dim)
+
+    if la <= 0 or lt <= 0:
+        raise ValueError(
+            "Audio and text sequence lengths must be positive."
+        )
+    if ds % CROSS_ATTN_HEADS != 0:
+        raise ValueError(
+            "shared_dim must be divisible by cross-attention heads."
+        )
+    if ds % JCR_REDUCTION != 0:
+        raise ValueError(
+            "shared_dim must be divisible by JCR reduction."
+        )
+
+    macs = 0
+
+    # 1) Modality-specific representation learning.
+    macs += audio_subnet_macs(
+        sequence_length=la,
+        dim=da,
+        num_heads=AUDIO_LA_HEADS,
+    )
+    macs += text_subnet_macs(
+        sequence_length=lt,
+        dim=dt,
+        num_heads=TEXT_ATTN_HEADS,
+        low_rank_dim=TEXT_LOW_RANK_DIM,
+        asp_hidden=TEXT_ASP_HIDDEN,
+    )
+
+    # 2) Global-vector projections.
+    macs += da * ds
+    macs += dt * ds
+
+    # 3) Sequence projections using the same shared projection modules.
+    # These reuse parameters but incur additional computation.
+    macs += la * da * ds
+    macs += lt * dt * ds
+
+    # 4) Bidirectional cross-attention.
+    macs += cross_attention_macs(
+        query_length=la,
+        key_value_length=lt,
+        dim=ds,
+    )
+    macs += cross_attention_macs(
+        query_length=lt,
+        key_value_length=la,
+        dim=ds,
+    )
+
+    # 5) JCR.
+    bottleneck_dim = ds // JCR_REDUCTION
+    macs += (4 * ds) * bottleneck_dim
+    macs += bottleneck_dim * (4 * ds)
+
+    # 6) Classifier: [2D] -> D -> C.
+    macs += (2 * ds) * ds
+    macs += ds * num_classes
+
+    return int(macs)
+
+
+# ================= 数据 =================
+def get_feature_shape(path: str) -> Tuple[int, int]:
+    """只读取 .npy 元信息，返回 [sequence_length, feature_dim]。"""
+    array = np.load(path, mmap_mode="r")
+    if array.ndim != 2:
+        raise ValueError(
+            f"Expected a 2-D feature array, got {array.shape}: {path}"
+        )
+    return int(array.shape[0]), int(array.shape[1])
+
+
+def collect_sample_shapes(
+    dataset: MultimodalDataset,
+) -> List[Tuple[int, int, int, int]]:
+    """读取所有成对样本的真实音频/文本序列长度和维度。"""
+    shapes: List[Tuple[int, int, int, int]] = []
+
+    for audio_path, text_path, _ in dataset.samples:
+        audio_length, audio_dim = get_feature_shape(audio_path)
+        text_length, text_dim = get_feature_shape(text_path)
+
+        shapes.append(
+            (
+                audio_length,
+                text_length,
+                audio_dim,
+                text_dim,
+            )
+        )
+
+    if not shapes:
+        raise RuntimeError(
+            "No paired feature samples were found."
+        )
+
+    return shapes
+
+
+# ================= 主程序 =================
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Accurate parameter and FLOPs analysis for S4."
+    )
+    parser.add_argument(
+        "--data_root",
+        type=str,
+        default="NCMMSC2021",
+        help="Feature dataset root containing train/test.",
+    )
+    parser.add_argument(
+        "--split",
+        type=str,
+        default="test",
+        choices=["train", "test"],
+        help="Dataset split used for sequence-length-dependent FLOPs.",
+    )
+    parser.add_argument(
+        "--shared_dim",
+        type=int,
+        default=DEFAULT_SHARED_DIM,
+    )
+    parser.add_argument(
+        "--dropout",
+        type=float,
+        default=DEFAULT_DROPOUT,
+    )
+    parser.add_argument(
+        "--save_txt",
+        type=str,
+        default="s4_complexity.txt",
+    )
     args = parser.parse_args()
 
-    device = torch.device("cpu" if args.use_cpu or not torch.cuda.is_available() else "cuda")
+    split_root = Path(args.data_root) / args.split
 
-    class_map = {"AD": 0, "HC": 1, "MCI": 2}
-    class_names = [k for k, v in sorted(class_map.items(), key=lambda item: item[1])]
+    dataset = MultimodalDataset(
+        root_dir=split_root,
+        class_map=CLASS_MAP,
+    )
 
-    print(f"[INFO] 使用设备: {device}")
-    print(f"[INFO] 正在加载数据集: {os.path.join(args.data_root, args.split)}")
+    sample_shapes = collect_sample_shapes(dataset)
 
-    dataset, batch = get_one_batch(args.data_root, args.split, class_map, args.batch_size)
-    audio_x, audio_mask, text_x, text_mask, _ = batch
+    first_audio_dim = sample_shapes[0][2]
+    first_text_dim = sample_shapes[0][3]
 
-    audio_x = audio_x.to(device)
-    audio_mask = audio_mask.to(device)
-    text_x = text_x.to(device)
-    text_mask = text_mask.to(device)
+    for _, _, audio_dim, text_dim in sample_shapes:
+        if audio_dim != first_audio_dim:
+            raise RuntimeError(
+                "Audio feature dimension is inconsistent."
+            )
+        if text_dim != first_text_dim:
+            raise RuntimeError(
+                "Text feature dimension is inconsistent."
+            )
 
-    model = build_model(
-        test_dataset=dataset,
-        class_names=class_names,
-        device=device,
-        shared_dim=args.shared_dim,
+    model = MultiModalNet(
+        audio_dim=first_audio_dim,
+        text_dim=first_text_dim,
+        num_classes=DEFAULT_NUM_CLASSES,
+        fusion_type="gated_bi_cross_attention",
         dropout=args.dropout,
+        shared_dim=args.shared_dim,
     )
     model.eval()
 
-    if os.path.exists(args.weights_file):
-        state = torch.load(args.weights_file, map_location=device)
-        model.load_state_dict(state)
-        print(f"[INFO] 已加载权重: {args.weights_file}")
-    else:
-        print(f"[WARN] 未找到权重文件: {args.weights_file}")
-        print("[WARN] 将基于随机初始化模型统计 Params / FLOPs（参数量不受影响，FLOPs 也可正常统计）")
+    total_params, trainable_params = count_parameters(model)
+    breakdown = parameter_breakdown(model)
 
-    with torch.no_grad():
-        macs, params = profile(
-            model,
-            inputs=(audio_x, audio_mask, text_x, text_mask),
-            verbose=False,
+    if total_params != trainable_params:
+        raise RuntimeError(
+            "S4 total parameters and trainable parameters should be identical."
         )
 
-    # 常见写法：FLOPs ≈ 2 * MACs
-    flops = macs * 2
-    trainable_params = count_trainable_params(model)
+    sample_macs: List[int] = []
 
-    params_m = params / 1e6
-    trainable_params_m = trainable_params / 1e6
-    macs_g = macs / 1e9
-    flops_g = flops / 1e9
+    for (
+        audio_length,
+        text_length,
+        audio_dim,
+        text_dim,
+    ) in sample_shapes:
+        sample_macs.append(
+            s4_macs_per_sample(
+                audio_length=audio_length,
+                text_length=text_length,
+                audio_dim=audio_dim,
+                text_dim=text_dim,
+                shared_dim=args.shared_dim,
+                num_classes=DEFAULT_NUM_CLASSES,
+            )
+        )
+
+    mean_macs = float(np.mean(sample_macs))
+    mean_flops = 2.0 * mean_macs
 
     result_lines = [
-        "=" * 72,
-        "S4 模型复杂度统计（THOP）",
-        "=" * 72,
-        f"Data Root              : {args.data_root}",
-        f"Split                  : {args.split}",
-        f"Batch Size             : {args.batch_size}",
-        f"Device                 : {device}",
-        f"Shared Dim             : {args.shared_dim}",
-        f"Dropout                : {args.dropout}",
-        f"Fusion Type            : gated_bi_cross_attention",
-        f"Weights File           : {args.weights_file}",
-        "-" * 72,
-        f"Total Params           : {int(params):,} ({params_m:.2f}M)",
-        f"Trainable Params       : {int(trainable_params):,} ({trainable_params_m:.2f}M)",
-        f"MACs                   : {int(macs):,} ({macs_g:.2f}G)",
-        f"FLOPs (= 2 x MACs)     : {int(flops):,} ({flops_g:.2f}G)",
-        "=" * 72,
+        "=" * 76,
+        "S4 Complexity Analysis",
+        "=" * 76,
+        f"Data Root                  : {args.data_root}",
+        f"Split                      : {args.split}",
+        f"Samples                    : {len(sample_shapes)}",
+        f"Audio Feature Dim          : {first_audio_dim}",
+        f"Text Feature Dim           : {first_text_dim}",
+        f"Shared Dim                 : {args.shared_dim}",
+        f"Cross-Attention Heads      : {CROSS_ATTN_HEADS}",
+        f"JCR Reduction              : {JCR_REDUCTION}",
+        f"Fusion                     : Two-Branch + Bi-Cross Attention + JCR",
+        "-" * 76,
+        f"Total Params               : {total_params:,} ({total_params / 1e6:.6f} M)",
+        f"Trainable Params           : {trainable_params:,} ({trainable_params / 1e6:.6f} M)",
+        f"AudioSubNet Params         : {breakdown['audio_subnet']:,}",
+        f"TextSubNet Params          : {breakdown['text_subnet']:,}",
+        f"Audio Projection Params    : {breakdown['audio_projection']:,}",
+        f"Text Projection Params     : {breakdown['text_projection']:,}",
+        f"Audio<-Text Attn Params    : {breakdown['audio_from_text_attention']:,}",
+        f"Text<-Audio Attn Params    : {breakdown['text_from_audio_attention']:,}",
+        f"JCR Params                 : {breakdown['jcr']:,}",
+        f"Classifier Params          : {breakdown['classifier']:,}",
+        "-" * 76,
+        f"Mean MACs / Sample         : {mean_macs:,.0f} ({mean_macs / 1e9:.6f} G)",
+        f"Mean FLOPs / Sample        : {mean_flops:,.0f} ({mean_flops / 1e9:.6f} G)",
+        f"Min FLOPs / Sample         : {2.0 * min(sample_macs) / 1e9:.6f} G",
+        f"Max FLOPs / Sample         : {2.0 * max(sample_macs) / 1e9:.6f} G",
+        "-" * 76,
+        "FLOPs convention          : 2 x MACs",
+        "Counted operations        : Linear / matmul / bmm",
+        "Excluded operations       : masked mean, normalization, activation, mask, softmax, dropout",
+        "=" * 76,
     ]
-    print("\n" + "\n".join(result_lines) + "\n")
 
-    with open(args.save_txt, "w", encoding="utf-8") as f:
-        f.write("\n".join(result_lines))
+    text = "\n".join(result_lines)
+    print("\n" + text + "\n")
 
-    print(f"[INFO] 结果已保存到: {args.save_txt}")
+    output_path = Path(args.save_txt)
+    output_path.write_text(
+        text,
+        encoding="utf-8",
+    )
+    print(
+        f"[INFO] Saved to: {output_path.resolve()}"
+    )
 
 
 if __name__ == "__main__":
